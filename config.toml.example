@@ -1,0 +1,31 @@
+# kwin-health-monitor config
+# Copy to ~/.config/kwin-health-monitor/config.toml
+
+# How often to poll (seconds)
+poll_interval_sec = 10
+
+# How much history to keep (minutes)
+history_minutes = 60
+
+# Log directory (daily log files)
+# log_dir = "~/logs/kwin-health"
+
+# RSS memory thresholds (MB)
+rss_warn_mb = 600
+rss_crit_mb = 1000
+
+# File descriptor thresholds
+# Falls back to FDSize (table alloc, powers of 2) if /proc/<pid>/fd
+# isn't readable
+fd_warn = 1024
+fd_crit = 4096
+
+# GPU VRAM thresholds (percent of total)
+# NVIDIA via nvidia-smi, AMD via sysfs
+vram_warn_pct = 70
+vram_crit_pct = 90
+
+# RSS trend detection: warn if RSS grows by this many MB
+# within the trend window
+rss_trend_warn_mb = 50
+rss_trend_window_min = 5

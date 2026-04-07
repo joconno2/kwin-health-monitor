@@ -1,34 +1,27 @@
 # kwin-health-monitor
 
-System tray widget that monitors KDE KWin Wayland compositor health and flags degradation before it causes input lag.
+System tray monitor for KWin Wayland compositor health (memory, FDs, VRAM).
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue) ![KDE Plasma](https://img.shields.io/badge/KDE_Plasma-6-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Why
+
+KWin on Wayland has a [long-standing problem](https://bugs.kde.org/show_bug.cgi?id=498627) where it leaks memory and file descriptors over time, especially with NVIDIA drivers. After running long enough, kwin_wayland bloats to multiple GB and you start getting mouse lag and unresponsive windows. Restarting the compositor fixes it, but there's no built-in way to tell when you need to, so most people just notice when things are already bad and restart by hand.
+
+This puts a tray icon next to your clock that goes from green to yellow to red as KWin's resource usage climbs, so you can restart before the lag hits.
+
 ## What it does
 
-- Polls KWin every 10 seconds for RSS memory, file descriptor table size, thread count, and GPU VRAM (NVIDIA)
-- Shows a color-coded "K" icon in the system tray: **green** (healthy), **yellow** (warning), **red** (critical)
-- Tracks RSS growth trend and flags rapid increases (>50 MB in 5 minutes)
-- Sends a desktop notification on transition to red
-- Hover tooltip shows current metrics; click opens a history table (last hour)
-- Right-click menu: Show History, Restart KWin, Quit
-- Logs to `~/logs/kwin-health/YYYY-MM-DD.log`
+Polls kwin_wayland every 10 seconds for RSS memory, file descriptor count/table size, GPU VRAM (NVIDIA or AMD), and thread count. Shows the results as a colored **K** icon in the system tray. Hovering shows current numbers and KWin uptime, clicking opens a history table with the last hour of snapshots, and right-click gives you a menu to restart KWin or quit. You get a desktop notification when things go red.
 
-## Thresholds
-
-| Metric | Warning | Critical |
-|--------|---------|----------|
-| KWin RSS | 600 MB | 1000 MB |
-| FD table size | 1024 | 4096 |
-| GPU VRAM | 70% | 90% |
-| RSS trend (5 min) | +50 MB | -- |
+Daily logs go to `~/logs/kwin-health/`.
 
 ## Requirements
 
-- KDE Plasma 6 with KWin Wayland
+- KDE Plasma 6, KWin Wayland
 - Python 3.10+
 - PyQt6 (`python-pyqt6` on Arch)
-- NVIDIA GPU with `nvidia-smi` (GPU metrics are optional; gracefully skipped if unavailable)
+- GPU monitoring needs `nvidia-smi` (NVIDIA) or sysfs support (AMD). If neither is available, GPU stats are just skipped.
 
 ## Install
 
@@ -43,25 +36,45 @@ chmod +x ~/.local/bin/kwin-health-monitor.py
 cp kwin-health-monitor.desktop ~/.config/autostart/
 ```
 
-Or create `~/.config/autostart/kwin-health-monitor.desktop`:
-
-```ini
-[Desktop Entry]
-Type=Application
-Name=KWin Health Monitor
-Exec=/usr/bin/python3 /path/to/kwin-health-monitor.py
-Terminal=false
-```
-
 ### Run manually
 
 ```bash
-python3 kwin-health-monitor.py &
+python3 ~/.local/bin/kwin-health-monitor.py &
 ```
 
-## Why
+## Configuration
 
-KWin on Wayland (especially with NVIDIA) can accumulate GPU buffer state, file descriptors, or memory over long sessions, eventually causing mouse lag and input latency. Restarting the compositor fixes it instantly, but you need to know *when* to restart. This monitor watches for the degradation and alerts you before it gets bad.
+Copy `config.toml.example` to `~/.config/kwin-health-monitor/config.toml` if you want to change thresholds:
+
+```bash
+mkdir -p ~/.config/kwin-health-monitor
+cp config.toml.example ~/.config/kwin-health-monitor/config.toml
+```
+
+### Defaults
+
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| KWin RSS | 600 MB | 1000 MB |
+| FD table size | 1024 | 4096 |
+| GPU VRAM | 70% | 90% |
+| RSS trend (5 min) | +50 MB | -- |
+
+### CLI
+
+```
+  -c, --config PATH   config file (default: ~/.config/kwin-health-monitor/config.toml)
+  --interval SEC      poll interval in seconds (overrides config)
+  --no-log            disable file logging
+```
+
+## Notes
+
+Metrics come from `/proc/<pid>/status` (RSS, FD table size, threads) and `nvidia-smi` or `/sys/class/drm/` (VRAM). Nothing invasive, no ptrace, no debug interfaces.
+
+The FD count is tricky: `/proc/<pid>/fd` is often unreadable for KWin because it runs with elevated scheduling priority. In that case the monitor falls back to `FDSize` from `/proc/status`, which is the FD table allocation size (grows in powers of 2). Not exact, but good enough to catch leaks.
+
+"Restart KWin" runs `kwin_wayland --replace`. This restarts the compositor without logging you out, but some apps (Firefox in particular) will die. There's a confirmation dialog.
 
 ## License
 

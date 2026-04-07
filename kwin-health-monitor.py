@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-KWin Compositor Health Monitor - System tray widget.
-Tracks KWin memory, file descriptors, GPU VRAM, and flags degradation.
-Icon color: green (healthy) / yellow (warning) / red (critical).
-Tooltip and click menu show details and history.
+KWin compositor health monitor. Sits in the system tray and polls
+kwin_wayland for memory, FDs, and VRAM. Green/yellow/red icon.
 """
 
+import argparse
 import os
 import signal
 import subprocess
@@ -14,33 +13,61 @@ import time
 from collections import deque
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QHeaderView,
-    QLabel,
     QMenu,
+    QMessageBox,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
 
-# --- Configuration ---
-POLL_INTERVAL_MS = 10_000  # 10 seconds
-HISTORY_LEN = 360          # 1 hour at 10s intervals
-LOG_DIR = Path.home() / "logs" / "kwin-health"
+DEFAULT_CONFIG = {
+    "poll_interval_sec": 10,
+    "history_minutes": 60,
+    "log_dir": str(Path.home() / "logs" / "kwin-health"),
+    "rss_warn_mb": 600,
+    "rss_crit_mb": 1000,
+    "fd_warn": 1024,
+    "fd_crit": 4096,
+    "vram_warn_pct": 70,
+    "vram_crit_pct": 90,
+    "rss_trend_warn_mb": 50,
+    "rss_trend_window_min": 5,
+}
 
-# Thresholds
-KWIN_RSS_WARN_MB = 600
-KWIN_RSS_CRIT_MB = 1000
-KWIN_FD_WARN = 1024   # FDSize (table alloc) starts at 512 for KWin, doubles on growth
-KWIN_FD_CRIT = 4096
-VRAM_WARN_PCT = 70
-VRAM_CRIT_PCT = 90
-RSS_TREND_WARN_MB = 50  # growth over last 5 min
+CONFIG_PATH = Path.home() / ".config" / "kwin-health-monitor" / "config.toml"
+
+SEVERITY = {"green": 0, "yellow": 1, "red": 2}
+
+
+def load_config(path=None):
+    """Load config from TOML file, falling back to defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    p = Path(path) if path else CONFIG_PATH
+    if p.exists() and tomllib is not None:
+        with open(p, "rb") as f:
+            user = tomllib.load(f)
+        cfg.update(user)
+    return cfg
+
+
+def worse(current, new):
+    """Return the worse of two severity levels."""
+    return current if SEVERITY[current] >= SEVERITY[new] else new
 
 
 def find_kwin_pid():
@@ -49,17 +76,20 @@ def find_kwin_pid():
         out = subprocess.check_output(
             ["pidof", "kwin_wayland"], text=True, stderr=subprocess.DEVNULL
         ).strip()
-        # May return multiple PIDs; take the main one (highest RSS)
         pids = out.split()
         if len(pids) == 1:
             return int(pids[0])
+        # Multiple PIDs: take the one with highest RSS
         best_pid, best_rss = None, 0
         for p in pids:
             try:
-                rss = int(Path(f"/proc/{p}/status").read_text()
-                          .split("VmRSS:")[1].split()[0])
-                if rss > best_rss:
-                    best_pid, best_rss = int(p), rss
+                status = Path(f"/proc/{p}/status").read_text()
+                for line in status.splitlines():
+                    if line.startswith("VmRSS:"):
+                        rss = int(line.split()[1])
+                        if rss > best_rss:
+                            best_pid, best_rss = int(p), rss
+                        break
             except (FileNotFoundError, IndexError, ValueError):
                 continue
         return best_pid
@@ -67,56 +97,45 @@ def find_kwin_pid():
         return None
 
 
-def get_kwin_rss_kb(pid):
-    """Get KWin RSS in KB from /proc."""
+def read_proc_status(pid):
+    """Parse VmRSS, FDSize, Threads from /proc/<pid>/status in one read."""
+    result = {"rss_kb": None, "fd_size": None, "threads": None}
     try:
         status = Path(f"/proc/{pid}/status").read_text()
-        for line in status.splitlines():
-            if line.startswith("VmRSS:"):
-                return int(line.split()[1])
-    except (FileNotFoundError, ValueError):
-        pass
-    return None
-
-
-def get_kwin_fd_count(pid):
-    """Get KWin FD table size from /proc/status (FDSize).
-
-    Direct /proc/<pid>/fd listing is often permission-denied for KWin
-    due to its elevated scheduling class. FDSize is the allocated fd table
-    size (grows in powers of 2), readable without special permissions.
-    Not exact count but a useful proxy for leak detection.
-    """
-    try:
-        return len(os.listdir(f"/proc/{pid}/fd"))
-    except PermissionError:
-        # Fall back to FDSize from /proc/status
-        try:
-            status = Path(f"/proc/{pid}/status").read_text()
-            for line in status.splitlines():
-                if line.startswith("FDSize:"):
-                    return int(line.split()[1])
-        except (FileNotFoundError, ValueError):
-            pass
     except FileNotFoundError:
-        pass
-    return None
+        return result
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            try:
+                result["rss_kb"] = int(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("FDSize:"):
+            try:
+                result["fd_size"] = int(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("Threads:"):
+            try:
+                result["threads"] = int(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+    return result
 
 
-def get_kwin_threads(pid):
-    """Get KWin thread count."""
+def get_fd_count(pid):
+    """Try listing /proc/<pid>/fd; returns (count, "exact") or (None, "fallback")."""
     try:
-        status = Path(f"/proc/{pid}/status").read_text()
-        for line in status.splitlines():
-            if line.startswith("Threads:"):
-                return int(line.split()[1])
-    except (FileNotFoundError, ValueError):
-        pass
-    return None
+        return len(os.listdir(f"/proc/{pid}/fd")), "exact"
+    except PermissionError:
+        return None, "fallback"
+    except FileNotFoundError:
+        return None, None
 
 
 def get_gpu_vram():
-    """Get GPU VRAM (used_mb, total_mb) via nvidia-smi."""
+    """Return (used_mb, total_mb, vendor). Tries nvidia-smi, then AMD sysfs."""
+    # NVIDIA
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.used,memory.total",
@@ -124,13 +143,58 @@ def get_gpu_vram():
             text=True, stderr=subprocess.DEVNULL
         ).strip()
         used, total = out.split(",")
-        return int(used.strip()), int(total.strip())
-    except (subprocess.CalledProcessError, ValueError):
-        return None, None
+        return int(used.strip()), int(total.strip()), "nvidia"
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        pass
+
+    # AMD - read from sysfs
+    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+        vram_used = card / "device" / "mem_info_vram_used"
+        vram_total = card / "device" / "mem_info_vram_total"
+        if vram_used.exists() and vram_total.exists():
+            try:
+                used = int(vram_used.read_text().strip()) // (1024 * 1024)
+                total = int(vram_total.read_text().strip()) // (1024 * 1024)
+                return used, total, "amd"
+            except (ValueError, OSError):
+                continue
+
+    # Intel uses shared system memory; no useful VRAM number to report.
+    return None, None, None
+
+
+def get_kwin_uptime(pid):
+    """Process uptime in seconds, from /proc/<pid>/stat starttime."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # Field 22 (0-indexed: 21) is starttime in clock ticks
+        fields = stat.rsplit(")", 1)[1].split()
+        starttime_ticks = int(fields[19])  # index 19 after the comm field
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        uptime_sec = float(Path("/proc/uptime").read_text().split()[0])
+        return uptime_sec - (starttime_ticks / clk_tck)
+    except (FileNotFoundError, ValueError, IndexError, OSError):
+        return None
+
+
+def format_duration(seconds):
+    """Format seconds as human-readable duration."""
+    if seconds is None:
+        return "?"
+    s = int(seconds)
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h < 24:
+        return f"{h}h {m}m"
+    d = h // 24
+    h = h % 24
+    return f"{d}d {h}h"
 
 
 def make_icon(color_name):
-    """Create a simple colored circle icon."""
+    """Create a colored circle icon with 'K' label."""
     size = 64
     pix = QPixmap(size, size)
     pix.fill(QColor(0, 0, 0, 0))
@@ -146,7 +210,6 @@ def make_icon(color_name):
     painter.setBrush(c)
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawEllipse(4, 4, size - 8, size - 8)
-    # Draw "K" in the center
     painter.setPen(QColor(255, 255, 255))
     font = painter.font()
     font.setPixelSize(36)
@@ -159,15 +222,17 @@ def make_icon(color_name):
 
 class HealthSnapshot:
     __slots__ = ("timestamp", "rss_mb", "fd_count", "threads",
-                 "vram_used_mb", "vram_total_mb", "status")
+                 "vram_used_mb", "vram_total_mb", "uptime_sec", "status")
 
-    def __init__(self, ts, rss, fd, threads, vram_used, vram_total, status):
+    def __init__(self, ts, rss, fd, threads, vram_used, vram_total,
+                 uptime, status):
         self.timestamp = ts
         self.rss_mb = rss
         self.fd_count = fd
         self.threads = threads
         self.vram_used_mb = vram_used
         self.vram_total_mb = vram_total
+        self.uptime_sec = uptime
         self.status = status
 
 
@@ -177,72 +242,89 @@ class HistoryDialog(QDialog):
     def __init__(self, history, parent=None):
         super().__init__(parent)
         self.setWindowTitle("KWin Health History")
-        self.setMinimumSize(700, 400)
+        self.setMinimumSize(750, 400)
         layout = QVBoxLayout(self)
 
         table = QTableWidget()
-        headers = ["Time", "Status", "RSS (MB)", "FDs", "Threads",
-                    "VRAM Used", "VRAM %"]
+        headers = ["Time", "Status", "Uptime", "RSS (MB)", "FDs",
+                    "Threads", "VRAM Used", "VRAM %"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
 
-        # Show most recent first
         snapshots = list(history)[::-1]
         table.setRowCount(len(snapshots))
+        status_colors = {
+            "green": QColor(200, 255, 200),
+            "yellow": QColor(255, 255, 200),
+            "red": QColor(255, 200, 200),
+        }
         for i, snap in enumerate(snapshots):
             table.setItem(i, 0, QTableWidgetItem(
                 time.strftime("%H:%M:%S", time.localtime(snap.timestamp))))
             item = QTableWidgetItem(snap.status.upper())
-            color = {"green": QColor(200, 255, 200),
-                     "yellow": QColor(255, 255, 200),
-                     "red": QColor(255, 200, 200)}.get(snap.status)
+            color = status_colors.get(snap.status)
             if color:
                 item.setBackground(color)
             table.setItem(i, 1, item)
             table.setItem(i, 2, QTableWidgetItem(
-                f"{snap.rss_mb:.0f}" if snap.rss_mb else "?"))
+                format_duration(snap.uptime_sec)))
             table.setItem(i, 3, QTableWidgetItem(
-                str(snap.fd_count) if snap.fd_count else "?"))
+                f"{snap.rss_mb:.0f}" if snap.rss_mb is not None else "?"))
             table.setItem(i, 4, QTableWidgetItem(
-                str(snap.threads) if snap.threads else "?"))
+                str(snap.fd_count) if snap.fd_count is not None else "?"))
             table.setItem(i, 5, QTableWidgetItem(
-                f"{snap.vram_used_mb}" if snap.vram_used_mb else "?"))
-            if snap.vram_used_mb and snap.vram_total_mb:
+                str(snap.threads) if snap.threads is not None else "?"))
+            table.setItem(i, 6, QTableWidgetItem(
+                f"{snap.vram_used_mb}" if snap.vram_used_mb is not None
+                else "?"))
+            if snap.vram_used_mb is not None and snap.vram_total_mb:
                 pct = 100 * snap.vram_used_mb / snap.vram_total_mb
-                table.setItem(i, 6, QTableWidgetItem(f"{pct:.0f}%"))
+                table.setItem(i, 7, QTableWidgetItem(f"{pct:.0f}%"))
             else:
-                table.setItem(i, 6, QTableWidgetItem("?"))
+                table.setItem(i, 7, QTableWidgetItem("?"))
 
         layout.addWidget(table)
 
 
 class KWinHealthMonitor:
-    def __init__(self):
+    def __init__(self, cfg, enable_logging=True):
+        self.cfg = cfg
+        self.enable_logging = enable_logging
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
 
-        self.history = deque(maxlen=HISTORY_LEN)
+        poll_sec = cfg["poll_interval_sec"]
+        history_len = (cfg["history_minutes"] * 60) // poll_sec
+
+        self.history = deque(maxlen=history_len)
+        self.trend_samples = (cfg["rss_trend_window_min"] * 60) // poll_sec
         self.kwin_pid = find_kwin_pid()
         self.baseline_rss = None
         self.dialog = None
+        self.gpu_vendor = None
 
         # Log setup
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.log_dir = Path(cfg["log_dir"])
+        if self.enable_logging:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pre-render icons
+        self.icons = {c: make_icon(c) for c in
+                      ("green", "yellow", "red", "gray")}
 
         # System tray
-        self.tray = QSystemTrayIcon(make_icon("gray"), self.app)
+        self.tray = QSystemTrayIcon(self.icons["gray"], self.app)
         self.tray.setToolTip("KWin Health: starting...")
         self.tray.activated.connect(self._on_tray_click)
 
-        # Context menu
         menu = QMenu()
         history_action = QAction("Show History", menu)
         history_action.triggered.connect(self._show_history)
         menu.addAction(history_action)
 
-        restart_action = QAction("Restart KWin", menu)
+        restart_action = QAction("Restart KWin...", menu)
         restart_action.triggered.connect(self._restart_kwin)
         menu.addAction(restart_action)
 
@@ -257,9 +339,7 @@ class KWinHealthMonitor:
         # Poll timer
         self.timer = QTimer()
         self.timer.timeout.connect(self._poll)
-        self.timer.start(POLL_INTERVAL_MS)
-
-        # Initial poll
+        self.timer.start(poll_sec * 1000)
         self._poll()
 
     def _poll(self):
@@ -271,15 +351,26 @@ class KWinHealthMonitor:
         if not self.kwin_pid:
             self.kwin_pid = find_kwin_pid()
             if not self.kwin_pid:
-                self.tray.setIcon(make_icon("gray"))
+                self.tray.setIcon(self.icons["gray"])
                 self.tray.setToolTip("KWin Health: compositor not found")
                 return
 
-        rss_kb = get_kwin_rss_kb(self.kwin_pid)
-        rss_mb = rss_kb / 1024 if rss_kb else None
-        fd_count = get_kwin_fd_count(self.kwin_pid)
-        threads = get_kwin_threads(self.kwin_pid)
-        vram_used, vram_total = get_gpu_vram()
+        pid = self.kwin_pid
+
+        # Single /proc/status read for RSS, FDSize, threads
+        proc = read_proc_status(pid)
+        rss_mb = proc["rss_kb"] / 1024 if proc["rss_kb"] else None
+
+        # Try exact FD count, fall back to FDSize
+        fd_exact, fd_mode = get_fd_count(pid)
+        fd_count = fd_exact if fd_exact is not None else proc["fd_size"]
+        fd_is_exact = fd_exact is not None
+
+        threads = proc["threads"]
+        vram_used, vram_total, vendor = get_gpu_vram()
+        if vendor:
+            self.gpu_vendor = vendor
+        uptime = get_kwin_uptime(pid)
 
         if self.baseline_rss is None and rss_mb is not None:
             self.baseline_rss = rss_mb
@@ -289,78 +380,91 @@ class KWinHealthMonitor:
         status = "green"
 
         if rss_mb is not None:
-            if rss_mb > KWIN_RSS_CRIT_MB:
+            if rss_mb > self.cfg["rss_crit_mb"]:
                 status = "red"
                 issues.append(f"RSS critical: {rss_mb:.0f} MB")
-            elif rss_mb > KWIN_RSS_WARN_MB:
-                status = max(status, "yellow", key=lambda s: ["green", "yellow", "red"].index(s))
+            elif rss_mb > self.cfg["rss_warn_mb"]:
+                status = worse(status, "yellow")
                 issues.append(f"RSS high: {rss_mb:.0f} MB")
 
         if fd_count is not None:
-            if fd_count > KWIN_FD_CRIT:
-                status = "red"
+            if fd_count > self.cfg["fd_crit"]:
+                status = worse(status, "red")
                 issues.append(f"FDs critical: {fd_count}")
-            elif fd_count > KWIN_FD_WARN:
-                status = max(status, "yellow", key=lambda s: ["green", "yellow", "red"].index(s))
+            elif fd_count > self.cfg["fd_warn"]:
+                status = worse(status, "yellow")
                 issues.append(f"FDs high: {fd_count}")
 
-        if vram_used is not None and vram_total is not None and vram_total > 0:
+        if vram_used is not None and vram_total and vram_total > 0:
             vram_pct = 100 * vram_used / vram_total
-            if vram_pct > VRAM_CRIT_PCT:
-                status = "red"
+            if vram_pct > self.cfg["vram_crit_pct"]:
+                status = worse(status, "red")
                 issues.append(f"VRAM critical: {vram_pct:.0f}%")
-            elif vram_pct > VRAM_WARN_PCT:
-                status = max(status, "yellow", key=lambda s: ["green", "yellow", "red"].index(s))
+            elif vram_pct > self.cfg["vram_warn_pct"]:
+                status = worse(status, "yellow")
                 issues.append(f"VRAM high: {vram_pct:.0f}%")
 
-        # Trend: check RSS growth over last 5 min (30 samples)
-        if len(self.history) >= 30:
-            old_rss = self.history[-30].rss_mb
-            if old_rss and rss_mb and (rss_mb - old_rss) > RSS_TREND_WARN_MB:
-                status = max(status, "yellow", key=lambda s: ["green", "yellow", "red"].index(s))
-                issues.append(f"RSS rising: +{rss_mb - old_rss:.0f} MB/5min")
+        # RSS trend
+        if len(self.history) >= self.trend_samples:
+            old_rss = self.history[-self.trend_samples].rss_mb
+            if old_rss and rss_mb:
+                delta = rss_mb - old_rss
+                if delta > self.cfg["rss_trend_warn_mb"]:
+                    status = worse(status, "yellow")
+                    issues.append(
+                        f"RSS rising: +{delta:.0f} MB/"
+                        f"{self.cfg['rss_trend_window_min']}min")
 
         now = time.time()
         snap = HealthSnapshot(now, rss_mb, fd_count, threads,
-                              vram_used, vram_total, status)
+                              vram_used, vram_total, uptime, status)
         self.history.append(snap)
 
-        # Update tray
-        self.tray.setIcon(make_icon(status))
+        # Update tray icon
+        self.tray.setIcon(self.icons[status])
 
-        vram_str = ""
-        if vram_used is not None and vram_total is not None:
-            vram_str = f"\nVRAM: {vram_used}/{vram_total} MB ({100*vram_used/vram_total:.0f}%)"
-
-        tooltip = (
-            f"KWin Health: {status.upper()}\n"
-            f"PID: {self.kwin_pid}\n"
-            f"RSS: {rss_mb:.0f} MB" + (f" (baseline: {self.baseline_rss:.0f})" if self.baseline_rss else "") + "\n"
-            f"FDs: {fd_count or '?'}  Threads: {threads or '?'}"
-            f"{vram_str}"
-        )
+        # Build tooltip
+        lines = [f"KWin Health: {status.upper()}"]
+        lines.append(f"PID {pid}  up {format_duration(uptime)}")
+        if rss_mb is not None:
+            rss_line = f"RSS: {rss_mb:.0f} MB"
+            if self.baseline_rss is not None:
+                rss_line += f" (baseline: {self.baseline_rss:.0f})"
+            lines.append(rss_line)
+        fd_label = "FDs" if fd_is_exact else "FDSize"
+        lines.append(
+            f"{fd_label}: {fd_count or '?'}  "
+            f"Threads: {threads or '?'}")
+        if vram_used is not None and vram_total:
+            pct = 100 * vram_used / vram_total
+            lines.append(
+                f"VRAM: {vram_used}/{vram_total} MB "
+                f"({pct:.0f}%) [{self.gpu_vendor}]")
         if issues:
-            tooltip += "\n--- Issues ---\n" + "\n".join(issues)
-
-        self.tray.setToolTip(tooltip)
+            lines.append("---")
+            lines.extend(issues)
+        self.tray.setToolTip("\n".join(lines))
 
         # Log
-        log_file = LOG_DIR / time.strftime("%Y-%m-%d.log")
-        with open(log_file, "a") as f:
+        if self.enable_logging:
+            log_file = self.log_dir / time.strftime("%Y-%m-%d.log")
             parts = [time.strftime("%H:%M:%S"), f"status={status}"]
             if rss_mb is not None:
                 parts.append(f"rss={rss_mb:.0f}MB")
             if fd_count is not None:
-                parts.append(f"fds={fd_count}")
+                parts.append(f"{'fds' if fd_is_exact else 'fdsize'}={fd_count}")
             if threads is not None:
                 parts.append(f"threads={threads}")
             if vram_used is not None:
                 parts.append(f"vram={vram_used}/{vram_total}MB")
+            if uptime is not None:
+                parts.append(f"uptime={format_duration(uptime)}")
             if issues:
                 parts.append(f"issues=[{'; '.join(issues)}]")
-            f.write(" ".join(parts) + "\n")
+            with open(log_file, "a") as f:
+                f.write(" ".join(parts) + "\n")
 
-        # Notify on transition to red
+        # Desktop notification on transition to red
         if status == "red" and len(self.history) >= 2:
             prev = self.history[-2]
             if prev.status != "red":
@@ -368,7 +472,7 @@ class KWinHealthMonitor:
                     "KWin Health Warning",
                     "\n".join(issues),
                     QSystemTrayIcon.MessageIcon.Warning,
-                    5000
+                    5000,
                 )
 
     def _on_tray_click(self, reason):
@@ -382,13 +486,23 @@ class KWinHealthMonitor:
         self.dialog.show()
 
     def _restart_kwin(self):
-        """Restart KWin via its DBus replace mechanism."""
-        subprocess.Popen(
-            ["kwin_wayland", "--replace"],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        """kwin_wayland --replace, with a confirmation dialog first."""
+        reply = QMessageBox.question(
+            None,
+            "Restart KWin?",
+            "This will restart the compositor.\n"
+            "Some applications (e.g. Firefox) may close.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
+        if reply == QMessageBox.StandardButton.Yes:
+            subprocess.Popen(
+                ["kwin_wayland", "--replace"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
     def run(self):
         signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -396,6 +510,27 @@ class KWinHealthMonitor:
         return self.app.exec()
 
 
-if __name__ == "__main__":
-    monitor = KWinHealthMonitor()
+def main():
+    parser = argparse.ArgumentParser(
+        description="KWin Wayland compositor health monitor")
+    parser.add_argument(
+        "-c", "--config", metavar="PATH",
+        help=f"config file path (default: {CONFIG_PATH})")
+    parser.add_argument(
+        "--interval", type=int, metavar="SEC",
+        help="poll interval in seconds (overrides config)")
+    parser.add_argument(
+        "--no-log", action="store_true",
+        help="disable file logging")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    if args.interval:
+        cfg["poll_interval_sec"] = args.interval
+
+    monitor = KWinHealthMonitor(cfg, enable_logging=not args.no_log)
     sys.exit(monitor.run())
+
+
+if __name__ == "__main__":
+    main()
