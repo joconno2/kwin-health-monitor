@@ -25,21 +25,30 @@ Daily logs go to `~/logs/kwin-health/`.
 
 ## Install
 
+### Arch Linux (AUR)
+
+```bash
+paru -S kwin-health-monitor-git
+```
+
+Then copy the desktop file to autostart:
+
+```bash
+cp /usr/share/applications/kwin-health-monitor.desktop ~/.config/autostart/
+```
+
+### Manual
+
 ```bash
 cp kwin-health-monitor.py ~/.local/bin/
 chmod +x ~/.local/bin/kwin-health-monitor.py
-```
-
-### Autostart with Plasma
-
-```bash
 cp kwin-health-monitor.desktop ~/.config/autostart/
 ```
 
-### Run manually
+### Run
 
 ```bash
-python3 ~/.local/bin/kwin-health-monitor.py &
+kwin-health-monitor &
 ```
 
 ## Configuration
