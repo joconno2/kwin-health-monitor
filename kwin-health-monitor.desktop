@@ -2,7 +2,7 @@
 Type=Application
 Name=KWin Health Monitor
 Comment=System tray monitor for KWin compositor health
-Exec=/usr/bin/python3 /home/jim/.local/bin/kwin-health-monitor.py
+Exec=kwin-health-monitor
 Icon=preferences-system-performance
 Terminal=false
 X-GNOME-Autostart-enabled=true
